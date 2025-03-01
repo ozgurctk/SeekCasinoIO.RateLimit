@@ -1,7 +1,7 @@
 namespace SeekCasinoIO.RateLimit.Core.Attributes;
 
 /// <summary>
-/// Attribute to apply rate limiting to a controller or action.
+/// Attribute that specifies rate limits for a controller or action.
 /// </summary>
 [AttributeUsage(AttributeTargets.Class | AttributeTargets.Method, AllowMultiple = false, Inherited = true)]
 public class RateLimitAttribute : Attribute
@@ -12,7 +12,7 @@ public class RateLimitAttribute : Attribute
     public int PermitLimit { get; set; } = 100;
 
     /// <summary>
-    /// Gets or sets the time window in seconds in which the limit applies.
+    /// Gets or sets the time window in seconds.
     /// </summary>
     public int Window { get; set; } = 60;
 
@@ -27,39 +27,34 @@ public class RateLimitAttribute : Attribute
     public TimeSpan WindowTimeSpan => TimeSpan.FromSeconds(Window);
 
     /// <summary>
-    /// Gets or sets whether this rate limit applies to authenticated users only.
+    /// Gets or sets whether to include the client ID in the rate limit key.
+    /// If false, all clients share the same limit for the resource.
     /// </summary>
-    public bool AuthenticatedOnly { get; set; } = false;
+    public bool IncludeClientId { get; set; } = true;
 
     /// <summary>
-    /// Gets or sets whether this rate limit applies to anonymous users only.
+    /// Gets or sets whether to exempt clients with specific roles from rate limiting.
     /// </summary>
-    public bool AnonymousOnly { get; set; } = false;
+    public string[]? ExemptRoles { get; set; }
 
     /// <summary>
-    /// Gets or sets the client type to apply this limit to (e.g., "admin").
-    /// If null or empty, applies to all client types.
+    /// Gets or sets whether to include HTTP method in the resource identifier.
+    /// If true, different HTTP methods (GET, POST, etc.) have separate limits.
     /// </summary>
-    public string? ClientType { get; set; }
+    public bool IncludeHttpMethod { get; set; } = true;
 
     /// <summary>
-    /// Gets or sets a custom resource name for this rate limit.
-    /// If null or empty, a resource name will be generated based on the route.
-    /// </summary>
-    public string? ResourceName { get; set; }
-
-    /// <summary>
-    /// Creates a new instance of the <see cref="RateLimitAttribute"/> class.
+    /// Initializes a new instance of the <see cref="RateLimitAttribute"/> class.
     /// </summary>
     public RateLimitAttribute()
     {
     }
 
     /// <summary>
-    /// Creates a new instance of the <see cref="RateLimitAttribute"/> class.
+    /// Initializes a new instance of the <see cref="RateLimitAttribute"/> class.
     /// </summary>
     /// <param name="permitLimit">The number of requests permitted in the time window.</param>
-    /// <param name="window">The time window in seconds in which the limit applies.</param>
+    /// <param name="window">The time window in seconds.</param>
     public RateLimitAttribute(int permitLimit, int window)
     {
         PermitLimit = permitLimit;
