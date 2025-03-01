@@ -1,155 +1,119 @@
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
-using SeekCasinoIO.RateLimit.Core.Interfaces;
-using SeekCasinoIO.RateLimit.Core.Options;
+using SeekCasinoIO.RateLimit.Core.Storage;
 using StackExchange.Redis;
-using System.Collections.Concurrent;
 
 namespace SeekCasinoIO.RateLimit.Infrastructure.Storage;
 
 /// <summary>
-/// Redis implementation of the rate limit storage.
+/// Redis implementation of the rate limit storage for distributed scenarios.
 /// </summary>
-public class RedisRateLimitStorage : IRateLimitStorage, IDisposable
+public class RedisRateLimitStorage : IRateLimitStorage
 {
+    private readonly IConnectionMultiplexer _redis;
     private readonly ILogger<RedisRateLimitStorage> _logger;
-    private readonly ConnectionMultiplexer _redis;
-    private readonly IDatabase _db;
-    private readonly ConcurrentDictionary<string, Task<long>> _incrementTasks = new();
-    private bool _disposed;
 
     /// <summary>
-    /// Creates a new instance of the <see cref="RedisRateLimitStorage"/> class.
+    /// Initializes a new instance of the <see cref="RedisRateLimitStorage"/> class.
     /// </summary>
-    /// <param name="options">The rate limit options.</param>
+    /// <param name="redis">The Redis connection multiplexer.</param>
     /// <param name="logger">The logger.</param>
     public RedisRateLimitStorage(
-        IOptions<RateLimitOptions> options,
+        IConnectionMultiplexer redis,
         ILogger<RedisRateLimitStorage> logger)
     {
+        _redis = redis;
         _logger = logger;
-
-        var connectionString = options.Value.RedisConnectionString;
-        if (string.IsNullOrEmpty(connectionString))
-        {
-            throw new ArgumentException("Redis connection string is required for RedisRateLimitStorage", nameof(options));
-        }
-
-        _redis = ConnectionMultiplexer.Connect(connectionString);
-        _db = _redis.GetDatabase();
     }
 
     /// <inheritdoc />
-    public async Task<long> IncrementCounterAsync(string key, TimeSpan expiry, CancellationToken cancellationToken = default)
+    public async Task<long> IncrementAsync(string key, TimeSpan expiryTime, CancellationToken cancellationToken = default)
     {
-        _logger.LogDebug("Incrementing counter for key: {Key}", key);
+        var db = _redis.GetDatabase();
+        
+        // INCR the key and set expiration in a transaction
+        long count = await db.StringIncrementAsync(key);
+        
+        // Only set expiry if the key is new (count == 1)
+        if (count == 1)
+        {
+            await db.KeyExpireAsync(key, expiryTime);
+        }
 
-        // Use an Interlocked approach to ensure we're not sending multiple parallel increments for the same key
-        return await _incrementTasks.GetOrAdd(key, _ => IncrementInRedisAsync(key, expiry, cancellationToken));
+        _logger.LogDebug("Incremented counter for key {Key}: {Count}", key, count);
+        return count;
     }
 
-    private async Task<long> IncrementInRedisAsync(string key, TimeSpan expiry, CancellationToken cancellationToken)
+    /// <inheritdoc />
+    public async Task<long> GetCountAsync(string key, CancellationToken cancellationToken = default)
     {
-        try
+        var db = _redis.GetDatabase();
+        var value = await db.StringGetAsync(key);
+        
+        if (value.HasValue && value.TryParse(out long count))
         {
-            var count = await _db.StringIncrementAsync(key);
-            await _db.KeyExpireAsync(key, expiry);
-            
             return count;
         }
-        finally
+        
+        return 0;
+    }
+
+    /// <inheritdoc />
+    public async Task<TimeSpan> GetTimeToLiveAsync(string key, CancellationToken cancellationToken = default)
+    {
+        var db = _redis.GetDatabase();
+        var ttl = await db.KeyTimeToLiveAsync(key);
+        
+        return ttl ?? TimeSpan.Zero;
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> ResetAsync(string key, CancellationToken cancellationToken = default)
+    {
+        var db = _redis.GetDatabase();
+        bool result = await db.KeyDeleteAsync(key);
+        
+        _logger.LogDebug("Reset counter for key {Key}: {Result}", key, result);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public async Task<long> ResetByPatternAsync(string pattern, CancellationToken cancellationToken = default)
+    {
+        var server = GetServer();
+        if (server == null)
         {
-            // Remove the task from the dictionary after it completes
-            _incrementTasks.TryRemove(key, out _);
+            _logger.LogWarning("Could not find a Redis server to execute SCAN operation");
+            return 0;
         }
-    }
 
-    /// <inheritdoc />
-    public async Task<long> GetCounterAsync(string key, CancellationToken cancellationToken = default)
-    {
-        _logger.LogDebug("Getting counter for key: {Key}", key);
+        var db = _redis.GetDatabase();
+        var keyCount = 0L;
         
-        var value = await _db.StringGetAsync(key);
-        return value.HasValue ? (long)value : 0;
-    }
-
-    /// <inheritdoc />
-    public async Task ResetCounterAsync(string key, CancellationToken cancellationToken = default)
-    {
-        _logger.LogDebug("Resetting counter for key: {Key}", key);
+        // Find and delete all keys matching the pattern
+        foreach (var key in server.Keys(pattern: pattern))
+        {
+            if (await db.KeyDeleteAsync(key))
+            {
+                keyCount++;
+            }
+        }
         
-        await _db.KeyDeleteAsync(key);
-    }
-
-    /// <inheritdoc />
-    public async Task ResetCountersAsync(string keyPrefix, CancellationToken cancellationToken = default)
-    {
-        _logger.LogDebug("Resetting counters with prefix: {KeyPrefix}", keyPrefix);
-
-        // Use Lua script to delete keys with a pattern
-        var script = @"
-            local keys = redis.call('KEYS', @keyPattern)
-            if #keys > 0 then
-                return redis.call('DEL', unpack(keys))
-            end
-            return 0";
-
-        var result = await _db.ScriptEvaluateAsync(
-            script,
-            new { keyPattern = $"{keyPrefix}*" });
-        
-        _logger.LogDebug("Reset {Count} counters with prefix: {KeyPrefix}", (long)result, keyPrefix);
-    }
-
-    /// <inheritdoc />
-    public async Task<TimeSpan?> GetTimeToLiveAsync(string key, CancellationToken cancellationToken = default)
-    {
-        _logger.LogDebug("Getting TTL for key: {Key}", key);
-        
-        var ttl = await _db.KeyTimeToLiveAsync(key);
-        return ttl;
-    }
-
-    /// <inheritdoc />
-    public async Task SetAsync(string key, string value, TimeSpan expiry, CancellationToken cancellationToken = default)
-    {
-        _logger.LogDebug("Setting value for key: {Key}", key);
-        
-        await _db.StringSetAsync(key, value, expiry);
-    }
-
-    /// <inheritdoc />
-    public async Task<string?> GetAsync(string key, CancellationToken cancellationToken = default)
-    {
-        _logger.LogDebug("Getting value for key: {Key}", key);
-        
-        var value = await _db.StringGetAsync(key);
-        return value.HasValue ? (string)value : null;
-    }
-
-    /// <inheritdoc />
-    public void Dispose()
-    {
-        Dispose(true);
-        GC.SuppressFinalize(this);
+        _logger.LogDebug("Reset {Count} counters matching pattern {Pattern}", keyCount, pattern);
+        return keyCount;
     }
 
     /// <summary>
-    /// Releases the unmanaged resources used by the <see cref="RedisRateLimitStorage"/> and optionally releases the managed resources.
+    /// Gets a Redis server for operations that require server-side commands.
     /// </summary>
-    /// <param name="disposing">true to release both managed and unmanaged resources; false to release only unmanaged resources.</param>
-    protected virtual void Dispose(bool disposing)
+    /// <returns>A server endpoint or null if none are available.</returns>
+    private IServer? GetServer()
     {
-        if (_disposed)
+        var endpoints = _redis.GetEndPoints();
+        if (endpoints.Length == 0)
         {
-            return;
+            return null;
         }
 
-        if (disposing)
-        {
-            _redis?.Dispose();
-        }
-
-        _disposed = true;
+        return _redis.GetServer(endpoints[0]);
     }
 }
