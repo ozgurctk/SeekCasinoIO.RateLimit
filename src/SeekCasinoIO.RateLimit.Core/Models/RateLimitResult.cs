@@ -74,16 +74,4 @@ public class RateLimitResult
             ResetAt = resetAt
         };
     }
-
-    /// <summary>
-    /// Adds metadata to the rate limit result.
-    /// </summary>
-    /// <param name="key">The metadata key.</param>
-    /// <param name="value">The metadata value.</param>
-    /// <returns>This instance for method chaining.</returns>
-    public RateLimitResult WithMetadata(string key, string value)
-    {
-        Metadata[key] = value;
-        return this;
-    }
 }
