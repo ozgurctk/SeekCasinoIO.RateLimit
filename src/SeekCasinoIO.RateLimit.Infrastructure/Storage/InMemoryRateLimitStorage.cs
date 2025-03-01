@@ -1,9 +1,9 @@
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using SeekCasinoIO.RateLimit.Core.Interfaces;
-using SeekCasinoIO.RateLimit.Core.Options;
+using SeekCasinoIO.RateLimit.Core.Storage;
 using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 
 namespace SeekCasinoIO.RateLimit.Infrastructure.Storage;
 
@@ -14,18 +14,15 @@ public class InMemoryRateLimitStorage : IRateLimitStorage
 {
     private readonly IMemoryCache _cache;
     private readonly ILogger<InMemoryRateLimitStorage> _logger;
-    private readonly ConcurrentDictionary<string, long> _counters = new();
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _expirations = new();
+    private readonly ConcurrentDictionary<string, object> _locks = new();
 
     /// <summary>
-    /// Creates a new instance of the <see cref="InMemoryRateLimitStorage"/> class.
+    /// Initializes a new instance of the <see cref="InMemoryRateLimitStorage"/> class.
     /// </summary>
     /// <param name="cache">The memory cache.</param>
-    /// <param name="options">The rate limit options.</param>
     /// <param name="logger">The logger.</param>
     public InMemoryRateLimitStorage(
         IMemoryCache cache,
-        IOptions<RateLimitOptions> options,
         ILogger<InMemoryRateLimitStorage> logger)
     {
         _cache = cache;
@@ -33,119 +30,102 @@ public class InMemoryRateLimitStorage : IRateLimitStorage
     }
 
     /// <inheritdoc />
-    public Task<long> IncrementCounterAsync(string key, TimeSpan expiry, CancellationToken cancellationToken = default)
+    public Task<long> IncrementAsync(string key, TimeSpan expiryTime, CancellationToken cancellationToken = default)
     {
-        _logger.LogDebug("Incrementing counter for key: {Key}", key);
-        
-        // Increment the counter
-        var count = _counters.AddOrUpdate(
-            key,
-            _ => 1,
-            (_, existingCount) => existingCount + 1);
+        // Get a lock for the specific key to ensure atomicity
+        var lockObj = _locks.GetOrAdd(key, _ => new object());
 
-        // Update the expiration time
-        _expirations[key] = DateTimeOffset.UtcNow.Add(expiry);
+        long count;
+        lock (lockObj)
+        {
+            // Get current count
+            _cache.TryGetValue<CounterEntry>(key, out var entry);
+            entry ??= new CounterEntry { Count = 0, ExpiryTime = DateTimeOffset.UtcNow.Add(expiryTime) };
 
-        // Set up cache expiration to clean up the counter
-        _cache.Set(
-            key,
-            count,
-            new MemoryCacheEntryOptions
+            // Increment counter
+            entry.Count++;
+            count = entry.Count;
+
+            // Set with absolute expiration
+            var cacheOptions = new MemoryCacheEntryOptions
             {
-                AbsoluteExpirationRelativeToNow = expiry
-            }
-            .RegisterPostEvictionCallback((_, _, _, _) =>
-            {
-                _counters.TryRemove(key, out _);
-                _expirations.TryRemove(key, out _);
-            }));
+                AbsoluteExpiration = entry.ExpiryTime
+            };
 
+            _cache.Set(key, entry, cacheOptions);
+        }
+
+        _logger.LogDebug("Incremented counter for key {Key}: {Count}", key, count);
         return Task.FromResult(count);
     }
 
     /// <inheritdoc />
-    public Task<long> GetCounterAsync(string key, CancellationToken cancellationToken = default)
+    public Task<long> GetCountAsync(string key, CancellationToken cancellationToken = default)
     {
-        _logger.LogDebug("Getting counter for key: {Key}", key);
-        
-        // Return the current count or 0 if it doesn't exist
-        return Task.FromResult(_counters.GetValueOrDefault(key));
+        if (_cache.TryGetValue<CounterEntry>(key, out var entry))
+        {
+            return Task.FromResult(entry.Count);
+        }
+
+        return Task.FromResult(0L);
     }
 
     /// <inheritdoc />
-    public Task ResetCounterAsync(string key, CancellationToken cancellationToken = default)
+    public Task<TimeSpan> GetTimeToLiveAsync(string key, CancellationToken cancellationToken = default)
     {
-        _logger.LogDebug("Resetting counter for key: {Key}", key);
-        
-        // Remove the counter
-        _counters.TryRemove(key, out _);
-        _expirations.TryRemove(key, out _);
+        if (_cache.TryGetValue<CounterEntry>(key, out var entry))
+        {
+            var remaining = entry.ExpiryTime - DateTimeOffset.UtcNow;
+            return Task.FromResult(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
+        }
+
+        return Task.FromResult(TimeSpan.Zero);
+    }
+
+    /// <inheritdoc />
+    public Task<bool> ResetAsync(string key, CancellationToken cancellationToken = default)
+    {
         _cache.Remove(key);
-
-        return Task.CompletedTask;
+        _locks.TryRemove(key, out _);
+        _logger.LogDebug("Reset counter for key {Key}", key);
+        return Task.FromResult(true);
     }
 
     /// <inheritdoc />
-    public Task ResetCountersAsync(string keyPrefix, CancellationToken cancellationToken = default)
+    public Task<long> ResetByPatternAsync(string pattern, CancellationToken cancellationToken = default)
     {
-        _logger.LogDebug("Resetting counters with prefix: {KeyPrefix}", keyPrefix);
-        
-        // Find and remove all counters with the specified prefix
-        var keysToRemove = _counters.Keys
-            .Where(k => k.StartsWith(keyPrefix, StringComparison.OrdinalIgnoreCase))
-            .ToList();
+        // Convert Redis-style pattern to a regular expression
+        var regex = PatternToRegex(pattern);
+        var keys = _locks.Keys.Where(k => regex.IsMatch(k)).ToList();
 
-        foreach (var key in keysToRemove)
+        foreach (var key in keys)
         {
-            _counters.TryRemove(key, out _);
-            _expirations.TryRemove(key, out _);
             _cache.Remove(key);
+            _locks.TryRemove(key, out _);
         }
 
-        return Task.CompletedTask;
+        _logger.LogDebug("Reset {Count} counters matching pattern {Pattern}", keys.Count, pattern);
+        return Task.FromResult((long)keys.Count);
     }
 
-    /// <inheritdoc />
-    public Task<TimeSpan?> GetTimeToLiveAsync(string key, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Converts a Redis-style pattern to a regular expression.
+    /// </summary>
+    private static Regex PatternToRegex(string pattern)
     {
-        _logger.LogDebug("Getting TTL for key: {Key}", key);
-        
-        // Check if the key exists and has an expiration
-        if (_expirations.TryGetValue(key, out var expiration))
-        {
-            var ttl = expiration - DateTimeOffset.UtcNow;
-            return Task.FromResult<TimeSpan?>(ttl > TimeSpan.Zero ? ttl : TimeSpan.Zero);
-        }
+        string regexPattern = pattern
+            .Replace(".", "\\.")
+            .Replace("*", ".*");
 
-        return Task.FromResult<TimeSpan?>(null);
+        return new Regex($"^{regexPattern}$", RegexOptions.Compiled);
     }
 
-    /// <inheritdoc />
-    public Task SetAsync(string key, string value, TimeSpan expiry, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Internal class used to store counter information.
+    /// </summary>
+    private class CounterEntry
     {
-        _logger.LogDebug("Setting value for key: {Key}", key);
-        
-        _cache.Set(
-            key,
-            value,
-            new MemoryCacheEntryOptions
-            {
-                AbsoluteExpirationRelativeToNow = expiry
-            });
-
-        return Task.CompletedTask;
-    }
-
-    /// <inheritdoc />
-    public Task<string?> GetAsync(string key, CancellationToken cancellationToken = default)
-    {
-        _logger.LogDebug("Getting value for key: {Key}", key);
-        
-        if (_cache.TryGetValue(key, out string? value))
-        {
-            return Task.FromResult(value);
-        }
-
-        return Task.FromResult<string?>(null);
+        public long Count { get; set; }
+        public DateTimeOffset ExpiryTime { get; set; }
     }
 }
